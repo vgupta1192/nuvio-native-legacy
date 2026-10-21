@@ -1,5 +1,5 @@
 name: Build Nuvio Native Legacy Android (upstream release sync)
-# sync-pulse: init
+# sync-pulse: v2.0.7 2026-10-21T19:00:06Z
 
 on:
   push:
