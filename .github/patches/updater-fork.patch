@@ -1,0 +1,26 @@
+diff --git a/src/atualizacao.c b/src/atualizacao.c
+index 9ba5b5ec..f64f8bea 100644
+--- a/src/atualizacao.c
++++ b/src/atualizacao.c
+@@ -129,9 +129,9 @@ static void at_sha256_hex(const unsigned char *buf, size_t n, char *hex65) {
+ }
+ #endif
+ 
+-#define AT_URL   "https://api.github.com/repos/iqui27/nuvio-native-legacy/releases/latest"
++#define AT_URL   "https://api.github.com/repos/vgupta1192/nuvio-native-legacy/releases?per_page=1"
+ #define AT_ARQ   "atualizacao-vista.txt"
+-#define AT_PAGINA "https://github.com/iqui27/nuvio-native-legacy/releases"
++#define AT_PAGINA "https://github.com/vgupta1192/nuvio-native-legacy/releases"
+ #define AT_APPID  NV_APP_ID
+ #define AT_LUNA_PUB "/usr/bin/luna-send-pub"
+ #define AT_LOG_INST "/tmp/nuvio-instalar.log"
+@@ -564,6 +564,9 @@ static int fioConsulta(void *arg) {
+   if (!corpo) { printf("[atualizacao] sem resposta do GitHub\n"); fflush(stdout); }
+   else {
+     textoJson(corpo, "tag_name", tag, sizeof tag);
++    // Fork releases are tagged "legacy-android-<upstream tag>" and are all prereleases,
++    // so /releases/latest is empty; the list endpoint returns the newest first.
++    if (!strncmp(tag, "legacy-android-", 15)) memmove(tag, tag + 15, strlen(tag + 15) + 1);
+     textoJson(corpo, "body", body, sizeof body);
+     // Sem anexo da variante desta build, ipkUrl fica vazio e podeInstalar()
+     // devolve 0: o cartao aparece so com a URL da pagina.

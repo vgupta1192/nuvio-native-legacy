@@ -73,17 +73,17 @@ jobs:
       # Optional fork patches, one per feature. Warning-only: a patch that no longer applies is
       # skipped and the build goes on without it.
       #   custom-stretch: aspect mode "Custom Stretch" (removes the black bars baked into the file)
+      #   updater-fork: in-app updater checks this fork's legacy-android-* releases, not upstream's
       - name: Apply fork patches
         id: patches
         if: steps.ver.outputs.should_build == 'true'
         run: |
           APPLIED=""; SKIPPED=""
-          for P in custom-stretch; do
+          for P in custom-stretch updater-fork; do
             if git apply "fork-src/.github/patches/$P.patch"; then
               echo "applied $P.patch"; APPLIED="$APPLIED $P"
             else
               echo "::warning::$P.patch no longer applies to upstream master; building without it"
-              git reset --hard -q; git clean -fdq -e fork-src
               SKIPPED="$SKIPPED $P"
             fi
           done
