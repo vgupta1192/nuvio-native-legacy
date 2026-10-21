@@ -1,0 +1,13 @@
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 4b9c162b..479f4eb7 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -25,7 +25,7 @@ android {
+     ndkVersion = "27.2.12479018"
+ 
+     defaultConfig {
+-        applicationId = "space.nuvio.nativelegacy"
++        applicationId = "space.nuvio.nativelegacy.selfhost"  // distinct from upstream: different signing key cannot update in place
+         minSdk = 24
+         targetSdk = 35
+         versionCode = vx * 10000 + vy * 100 + vz

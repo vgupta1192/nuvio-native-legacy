@@ -74,12 +74,13 @@ jobs:
       # skipped and the build goes on without it.
       #   custom-stretch: aspect mode "Custom Stretch" (removes the black bars baked into the file)
       #   updater-fork: in-app updater checks this fork's legacy-android-* releases, not upstream's
+      #   selfhost-appid: package space.nuvio.nativelegacy.selfhost, installs next to upstream's app (different signing key)
       - name: Apply fork patches
         id: patches
         if: steps.ver.outputs.should_build == 'true'
         run: |
           APPLIED=""; SKIPPED=""
-          for P in custom-stretch updater-fork; do
+          for P in custom-stretch updater-fork selfhost-appid; do
             if git apply "fork-src/.github/patches/$P.patch"; then
               echo "applied $P.patch"; APPLIED="$APPLIED $P"
             else
