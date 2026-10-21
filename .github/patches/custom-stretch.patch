@@ -1,0 +1,592 @@
+diff --git a/android/app/src/main/java/space/nuvio/nativelegacy/CustomStretch.kt b/android/app/src/main/java/space/nuvio/nativelegacy/CustomStretch.kt
+new file mode 100644
+index 00000000..35a6a77e
+--- /dev/null
++++ b/android/app/src/main/java/space/nuvio/nativelegacy/CustomStretch.kt
+@@ -0,0 +1,306 @@
++package space.nuvio.nativelegacy
++
++import android.graphics.Bitmap
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.min
++
++/**
++ * Custom Stretch: find the black bars baked into the video frame (letterbox, pillarbox or
++ * both) so the player can stretch only the picture area over the whole screen.
++ *
++ * Plain "Esticar" scales the decoded frame to the screen, so bars inside the file stay
++ * visible. Here the frame is sampled, the picture area is measured and handed to the C
++ * player (player.c, PLR_ASP_CUSTOM_STRETCH), which maps that area to the full screen.
++ * Nothing inside the picture area is cropped: only bar edges that meet clearly brighter
++ * picture are trusted, and each edge keeps the thinnest trusted bar, so a dark scene or a
++ * vignette can never make the picture smaller.
++ */
++
++/** Picture area inside the decoded frame, as fractions (0..1) of the frame size. */
++internal data class VideoContentRect(
++    val left: Float,
++    val top: Float,
++    val right: Float,
++    val bottom: Float,
++) {
++    fun isCloseTo(other: VideoContentRect, tolerance: Float = 0.004f): Boolean =
++        abs(left - other.left) <= tolerance &&
++            abs(top - other.top) <= tolerance &&
++            abs(right - other.right) <= tolerance &&
++            abs(bottom - other.bottom) <= tolerance
++}
++
++/**
++ * One frame's measurement: the picture area plus, per edge (left, top, right, bottom), whether
++ * that edge can be trusted. A bar edge is trusted only when a near-black bar meets clearly
++ * brighter picture; a dark scene or a vignette fading to black is not trusted.
++ */
++internal class BarSample(
++    val rect: VideoContentRect,
++    val confident: BooleanArray,
++    /** Coarse 4x4 grid of mean luma, to tell whether two samples show different frames. */
++    val signature: IntArray = IntArray(0),
++) {
++    /** Thickness of the bar at each edge (left, top, right, bottom) as frame fractions. */
++    val thickness: FloatArray
++        get() = floatArrayOf(rect.left, rect.top, 1f - rect.right, 1f - rect.bottom)
++
++    /** True when [other] shows a clearly different frame (not the same paused or static shot). */
++    fun differsFrom(other: IntArray?): Boolean {
++        if (other == null || other.size != signature.size || signature.isEmpty()) return true
++        var difference = 0
++        for (i in signature.indices) difference += abs(signature[i] - other[i])
++        return difference >= SIGNATURE_MIN_DIFFERENCE
++    }
++
++    companion object {
++        private const val SIGNATURE_MIN_DIFFERENCE = 64
++    }
++}
++
++internal object BlackBarDetector {
++    /** Luma (0..255) above this value counts as picture. Limited-range black is 16. */
++    private const val LUMA_LIMIT = 30
++
++    /** A row or column holds picture when this fraction of its pixels is above [LUMA_LIMIT]. */
++    private const val LINE_CONTENT_FRACTION = 0.02f
++
++    /** Bars thinner than this fraction of the frame are ignored (no visible gain, avoids jitter). */
++    private const val MIN_BAR_FRACTION = 0.006f
++
++    /** A sample whose picture is smaller than this is a dark scene or a logo, not the picture area. */
++    private const val MIN_CONTENT_WIDTH = 0.45f
++    private const val MIN_CONTENT_HEIGHT = 0.35f
++
++    /** A trusted bar is near black (baked bars are flat black; dark picture is noisier) ... */
++    private const val BAR_MAX_MEAN = 12
++
++    /** Bar mean including the corners (a logo there is allowed, picture is not). */
++    private const val BAR_MAX_MEAN_WITH_CORNERS = 24
++
++    /**
++     * ... and the picture lines right next to it are clearly brighter (a sharp edge). The brightest
++     * of the [EDGE_BAND_LINES] lines next to the bar counts, so a soft (scaled or blurred) edge row
++     * between bar and picture does not hide the edge.
++     */
++    private const val EDGE_MIN_CONTRAST = 24
++    private const val EDGE_BAND_LINES = 3
++
++    /**
++     * Bars are found in the middle of each line only (this fraction is skipped at both ends).
++     * Site logos and watermarks sit in the corners, often half inside a bar; they must not count
++     * as picture. Text in the middle of a bar (hardsubs) still keeps that bar.
++     */
++    private const val CORNER_FRACTION = 0.2f
++
++    /**
++     * Measure the picture area in one luma sample ([width] x [height]).
++     * Returns null when the sample is too dark to tell (black frame, fade, dark scene).
++     */
++    fun detect(luma: ByteArray, width: Int, height: Int): BarSample? {
++        val stride = width
++        if (width < 8 || height < 8 || luma.size < stride * (height - 1) + width) return null
++
++        val rowThreshold = max(2, (width * LINE_CONTENT_FRACTION).toInt())
++        val middleLeft = (width * CORNER_FRACTION).toInt()
++        val middleRight = width - middleLeft
++        var top = -1
++        var bottom = -1
++        for (y in 0 until height) {
++            if (countBright(luma, y * stride + middleLeft, 1, middleRight - middleLeft) >= rowThreshold) {
++                if (top < 0) top = y
++                bottom = y
++            }
++        }
++        if (top < 0) return null
++
++        val rows = bottom - top + 1
++        val columnThreshold = max(2, (rows * LINE_CONTENT_FRACTION).toInt())
++        val middleTop = top + (rows * CORNER_FRACTION).toInt()
++        val middleRows = rows - 2 * (rows * CORNER_FRACTION).toInt()
++        var left = -1
++        var right = -1
++        for (x in 0 until width) {
++            if (countBright(luma, middleTop * stride + x, stride, middleRows) >= columnThreshold) {
++                if (left < 0) left = x
++                right = x
++            }
++        }
++        if (left < 0) return null
++
++        // Edges in sample pixels; a bar thinner than MIN_BAR_FRACTION counts as no bar.
++        if (left < width * MIN_BAR_FRACTION) left = 0
++        if (top < height * MIN_BAR_FRACTION) top = 0
++        if (width - 1 - right < width * MIN_BAR_FRACTION) right = width - 1
++        if (height - 1 - bottom < height * MIN_BAR_FRACTION) bottom = height - 1
++        val pictureWidth = right - left + 1
++        val pictureHeight = bottom - top + 1
++        if (pictureWidth < width * MIN_CONTENT_WIDTH || pictureHeight < height * MIN_CONTENT_HEIGHT) return null
++
++        // Bar means skip the corners (logos); edge lines use the whole picture width or height.
++        val barLeft = max(left, middleLeft)
++        val barRight = min(right + 1, middleRight)
++        val barTop = max(top, middleTop)
++        val barBottom = min(bottom + 1, middleTop + middleRows)
++        fun rowMean(y: Int, x0: Int, x1: Int): Int {
++            var sum = 0L
++            for (x in x0 until x1) sum += luma[y * stride + x].toInt() and 0xFF
++            return if (x1 <= x0) 0 else (sum / (x1 - x0)).toInt()
++        }
++        fun columnMean(x: Int, y0: Int, y1: Int): Int {
++            var sum = 0L
++            for (y in y0 until y1) sum += luma[y * stride + x].toInt() and 0xFF
++            return if (y1 <= y0) 0 else (sum / (y1 - y0)).toInt()
++        }
++        fun rowsMean(from: Int, toExclusive: Int, x0: Int = barLeft, x1: Int = barRight): Int =
++            if (toExclusive <= from) 0 else (from until toExclusive).sumOf { rowMean(it, x0, x1) } / (toExclusive - from)
++        fun columnsMean(from: Int, toExclusive: Int, y0: Int = barTop, y1: Int = barBottom): Int =
++            if (toExclusive <= from) 0 else (from until toExclusive).sumOf { columnMean(it, y0, y1) } / (toExclusive - from)
++        fun rowBar(from: Int, toExclusive: Int): Int =
++            if (rowsMean(from, toExclusive, left, right + 1) > BAR_MAX_MEAN_WITH_CORNERS) 255 else rowsMean(from, toExclusive)
++        fun columnBar(from: Int, toExclusive: Int): Int =
++            if (columnsMean(from, toExclusive, top, bottom + 1) > BAR_MAX_MEAN_WITH_CORNERS) 255 else columnsMean(from, toExclusive)
++        fun brightestRow(from: Int, toExclusive: Int): Int =
++            (from until toExclusive).maxOfOrNull { rowMean(it, left, right + 1) } ?: 0
++        fun brightestColumn(from: Int, toExclusive: Int): Int =
++            (from until toExclusive).maxOfOrNull { columnMean(it, top, bottom + 1) } ?: 0
++        fun trusted(barMean: Int, edgeMean: Int) = barMean <= BAR_MAX_MEAN && edgeMean - barMean >= EDGE_MIN_CONTRAST
++
++        val band = EDGE_BAND_LINES
++        val confident = booleanArrayOf(
++            left == 0 || trusted(columnBar(0, left), brightestColumn(left, min(right + 1, left + band))),
++            top == 0 || trusted(rowBar(0, top), brightestRow(top, min(bottom + 1, top + band))),
++            right == width - 1 ||
++                trusted(columnBar(right + 1, width), brightestColumn(max(left, right + 1 - band), right + 1)),
++            bottom == height - 1 ||
++                trusted(rowBar(bottom + 1, height), brightestRow(max(top, bottom + 1 - band), bottom + 1)),
++        )
++        val rect = VideoContentRect(
++            left = left.toFloat() / width,
++            top = top.toFloat() / height,
++            right = (right + 1).toFloat() / width,
++            bottom = (bottom + 1).toFloat() / height,
++        )
++        return BarSample(rect, confident, signature(luma, width, height, stride))
++    }
++
++    private fun signature(luma: ByteArray, width: Int, height: Int, stride: Int): IntArray {
++        val grid = 4
++        val out = IntArray(grid * grid)
++        for (gy in 0 until grid) {
++            for (gx in 0 until grid) {
++                var sum = 0L
++                var count = 0
++                for (y in gy * height / grid until (gy + 1) * height / grid step 2) {
++                    for (x in gx * width / grid until (gx + 1) * width / grid step 2) {
++                        sum += luma[y * stride + x].toInt() and 0xFF
++                        count++
++                    }
++                }
++                out[gy * grid + gx] = if (count == 0) 0 else (sum / count).toInt()
++            }
++        }
++        return out
++    }
++
++    /** Luma of the pixels of an ARGB_8888 bitmap, BT.601 weights. */
++    fun lumaOf(bitmap: Bitmap): ByteArray {
++        val width = bitmap.width
++        val height = bitmap.height
++        val pixels = IntArray(width * height)
++        bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
++        val out = ByteArray(pixels.size)
++        for (i in pixels.indices) {
++            val c = pixels[i]
++            val r = (c shr 16) and 0xFF
++            val g = (c shr 8) and 0xFF
++            val b = c and 0xFF
++            out[i] = ((r * 77 + g * 150 + b * 29) shr 8).toByte()
++        }
++        return out
++    }
++
++    private fun countBright(luma: ByteArray, start: Int, step: Int, count: Int): Int {
++        var bright = 0
++        var index = start
++        repeat(count) {
++            if ((luma[index].toInt() and 0xFF) > LUMA_LIMIT) bright++
++            index += step
++        }
++        return bright
++    }
++}
++
++/**
++ * Collects samples for one title and decides when the stretch geometry changes.
++ *
++ * Each edge keeps the thinnest bar seen in a trusted sample (so the picture area is the union of
++ * trusted samples and never cuts picture). An edge is cropped only after [CONFIRMATIONS] trusted
++ * samples from different frames. Per axis the thinner side wins, because baked-in bars are
++ * centered. Bars on both axes (windowbox) are kept only when each is clearly there: a thin second
++ * axis is a dark or vignetted frame edge, and cropping it would stretch the other direction too.
++ */
++internal class BlackBarTracker {
++    private val thickness = FloatArray(4) { 1f }
++    private val observations = IntArray(4)
++    private var lastEvidence: IntArray? = null
++    private var samples = 0
++
++    @Volatile
++    var current: VideoContentRect? = null
++        private set
++
++    /** Sample faster until every edge is confirmed (or enough samples were taken). */
++    val isCalibrating: Boolean
++        get() = samples < MAX_CALIBRATION_SAMPLES && observations.any { it < CONFIRMATIONS }
++
++    fun reset() {
++        thickness.fill(1f)
++        observations.fill(0)
++        lastEvidence = null
++        samples = 0
++        current = null
++    }
++
++    /** Feed one sample. Returns true when the picture area changed. */
++    fun offer(sample: BarSample?): Boolean {
++        if (sample == null) return false
++        samples++
++        // The same (paused or static) shot counts once: a dark scene must not confirm itself.
++        if (!sample.differsFrom(lastEvidence)) return false
++        lastEvidence = sample.signature
++        val measured = sample.thickness
++        for (edge in 0 until 4) {
++            if (!sample.confident[edge]) continue
++            observations[edge]++
++            thickness[edge] = min(thickness[edge], measured[edge].coerceAtLeast(0f))
++        }
++        if (samples < CALIBRATION_SAMPLES) return false
++        val edge = FloatArray(4) { if (observations[it] >= CONFIRMATIONS) thickness[it] else 0f }
++        var horizontal = min(edge[0], edge[2])
++        var vertical = min(edge[1], edge[3])
++        if (horizontal > 0f && vertical > 0f) {
++            if (horizontal < SECOND_AXIS_MIN_BAR) horizontal = 0f
++            if (vertical < SECOND_AXIS_MIN_BAR) vertical = 0f
++        }
++        val rect = VideoContentRect(horizontal, vertical, 1f - horizontal, 1f - vertical)
++        val previous = current
++        if (previous != null && previous.isCloseTo(rect)) return false
++        current = rect
++        return true
++    }
++
++    companion object {
++        const val CALIBRATION_SAMPLES = 3
++        const val CONFIRMATIONS = 2
++        const val MAX_CALIBRATION_SAMPLES = 16
++        const val SECOND_AXIS_MIN_BAR = 0.03f
++        const val CALIBRATION_INTERVAL_MS = 1_200L
++        const val STEADY_INTERVAL_MS = 8_000L
++        const val FIRST_SAMPLE_DELAY_MS = 800L
++
++        /** Longest side of the sampled frame. Enough to place bar edges within ~0.3%. */
++        const val SAMPLE_MAX_DIMENSION = 320
++    }
++}
+diff --git a/android/app/src/main/java/space/nuvio/nativelegacy/NvPlayer.kt b/android/app/src/main/java/space/nuvio/nativelegacy/NvPlayer.kt
+index 885d4495..7ec9bfb4 100644
+--- a/android/app/src/main/java/space/nuvio/nativelegacy/NvPlayer.kt
++++ b/android/app/src/main/java/space/nuvio/nativelegacy/NvPlayer.kt
+@@ -275,6 +275,65 @@ object NvPlayer {
+         c.addView(v, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+         quadroView = v; quadroVisivel = true
+     }
++    // Custom Stretch (CustomStretch.kt). player.c polls stretchCrop() while that aspect mode is on.
++    // Every poll may start one PixelCopy of the video Surface (never more often than the tracker's
++    // interval); the answer is the picture area found so far, as permille packed
++    // left | top << 10 | right << 20 | bottom << 30, with bit 62 set. 0 = not known (yet).
++    // The Surface holds the whole decoded frame whatever the window crop, so the fractions stay
++    // frame-relative. Subtitles are drawn by the C layer and are not part of the capture.
++    private val barras = BlackBarTracker()
++    private var barrasSessao = -1
++    private var barrasUrl = ""
++    private var barrasProximo = 0L
++    private var barrasCapturando = false
++    @Synchronized @JvmStatic fun stretchCrop(): Long {
++        val agora = SystemClock.elapsedRealtime()
++        if (sessao != barrasSessao || urlAtual != barrasUrl) {
++            barras.reset()
++            barrasSessao = sessao; barrasUrl = urlAtual
++            barrasProximo = agora + BlackBarTracker.FIRST_SAMPLE_DELAY_MS
++        }
++        if (!barrasCapturando && agora >= barrasProximo) principal.post { stretchAmostrar() }
++        val r = barras.current ?: return 0L
++        fun pm(f: Float) = Math.round(f * 1000f).coerceIn(0, 1000).toLong()
++        return (1L shl 62) or pm(r.left) or (pm(r.top) shl 10) or (pm(r.right) shl 20) or (pm(r.bottom) shl 30)
++    }
++    private fun stretchAmostrar() {
++        val minha = sessao
++        val sv: SurfaceView
++        synchronized(this) {
++            if (barrasCapturando || SystemClock.elapsedRealtime() < barrasProximo) return
++            sv = superficie ?: return
++            if (!quadroVisto || !sv.holder.surface.isValid || sv.width <= 0 || sv.height <= 0) return
++            barrasCapturando = true
++        }
++        val escala = BlackBarTracker.SAMPLE_MAX_DIMENSION.toFloat() / maxOf(sv.width, sv.height)
++        val b = try {
++            Bitmap.createBitmap(
++                Math.round(sv.width * escala).coerceAtLeast(8), Math.round(sv.height * escala).coerceAtLeast(8),
++                Bitmap.Config.ARGB_8888)
++        } catch (_: OutOfMemoryError) { synchronized(this) { barrasCapturando = false }; return }
++        try {
++            PixelCopy.request(sv, b, { resultado ->
++                val amostra = if (resultado == PixelCopy.SUCCESS)
++                    BlackBarDetector.detect(BlackBarDetector.lumaOf(b), b.width, b.height) else null
++                b.recycle()
++                synchronized(this) {
++                    barrasCapturando = false
++                    if (minha == sessao && barrasSessao == sessao) {
++                        if (barras.offer(amostra)) Log.i(TAG, "[stretch] area ${barras.current}")
++                        barrasProximo = SystemClock.elapsedRealtime() +
++                            if (barras.isCalibrating) BlackBarTracker.CALIBRATION_INTERVAL_MS
++                            else BlackBarTracker.STEADY_INTERVAL_MS
++                    }
++                }
++            }, principal)
++        } catch (_: Exception) {
++            b.recycle()
++            synchronized(this) { barrasCapturando = false; barrasProximo = SystemClock.elapsedRealtime() + 2_000L }
++        }
++    }
++
+     private var cacheMidia: CacheMidia? = null
+     private var cacheEstado = CacheSessao.DESLIGADO
+     private var cacheTiques = 0
+diff --git a/src/ajustes.c b/src/ajustes.c
+index 15c7ede3..16ac96f0 100644
+--- a/src/ajustes.c
++++ b/src/ajustes.c
+@@ -792,7 +792,7 @@ static const char *V_DTS_SAIDA[] = { "Desligado", "5.1 (Dolby Digital)", "Estér
+ static const char *V_DTS_SAIDA[] = { "Estéreo (AAC)", "5.1 (Dolby Digital)" };
+ #define N_DTS_SAIDA 2
+ #endif
+-static const char *V_PROPORCAO[] = { "Último usado", "Original", "Recortar", "Esticar", "Zoom leve", "Zoom cinema", "Zoom ultra", "Ajustar altura", "Ajustar largura" };
++static const char *V_PROPORCAO[] = { "Último usado", "Original", "Recortar", "Esticar", "Zoom leve", "Zoom cinema", "Zoom ultra", "Ajustar altura", "Ajustar largura", "Custom Stretch" };
+ static const char *V_LOGO_APP[] = { "Novo", "Clássico" };
+ static const char *V_BUSCA_NUVIO[] = { "Primeiro", "Por último", "Desligado" };
+ static const char *V_ABERTURA[] = { "Padrão", "Só esmaece", "Direto" };
+@@ -1664,7 +1664,7 @@ static const Opcao OPCOES[AJ_N] = {
+   ESC("Modelo de regex",                 V_FONTE_MODELO, 7),  // espelho de fonteregra_modelo_atual
+   NUM("Espaço entre fileiras",           50, 300, 25, "%"),     // local: espacoFileirasLocal
+   NUM("Espaço entre títulos",            50, 300, 25, "%"),     // local: espacoTitulosLocal
+-  ESC("Proporção padrão",                V_PROPORCAO, 9),        // local: proporcaoPadraoLocal
++  ESC("Proporção padrão",                V_PROPORCAO, 10),        // local: proporcaoPadraoLocal
+   ESC("Também em Continuar assistindo",  V_LIGA, 2),             // local: cwRetidoTambemLocal
+   ESC("Continuar na escolha de perfil",  V_LIGA, 2),             // local: psContinuarLocal
+   ESC("DTS convertido em",               V_DTS_SAIDA, N_DTS_SAIDA), // local: dtsSaidaLocal (.tpk: dtsTpkLocal)
+@@ -2802,7 +2802,7 @@ int ajustes_esmaecer(void)         { int v = valor[AJ_ESMAECER]; return v < 0 ||
+ int ajustes_descanso_estilo(void)  { int v = valor[AJ_DESCANSO_ESTILO]; return v < 0 || v > 2 ? 0 : v; }
+ int ajustes_descanso_fonte(void)   { int v = valor[AJ_DESCANSO_FONTE]; return v < 0 || v > 1 ? 0 : v; }
+ // #202: -1 = ultimo modo usado; 0..7 = PlrAspecto a aplicar ao abrir o video.
+-int ajustes_proporcao_padrao(void) { int v = valor[AJ_PROPORCAO_PADRAO]; return v < 1 || v > 8 ? -1 : v - 1; }
++int ajustes_proporcao_padrao(void) { int v = valor[AJ_PROPORCAO_PADRAO]; return v < 1 || v > 9 ? -1 : v - 1; }
+ // Experimental HDR menus left the menu: off everywhere, even if saved as on.
+ int ajustes_hdr_interface(void) { return 0; }
+ int ajustes_tunneling(void) {
+diff --git a/src/player.c b/src/player.c
+index 25223669..755d6a67 100644
+--- a/src/player.c
++++ b/src/player.c
+@@ -1237,7 +1237,8 @@ static int    prefsLidas;
+ // portugues, entao traduzir aqui e o que mantem a tela coerente.
+ static const char *ASP_ROTULO[PLR_ASP_N] = {
+   "Original", "Recortar", "Esticar", "Zoom leve",
+-  "Zoom cinema", "Zoom ultra", "Ajustar altura", "Ajustar largura"
++  "Zoom cinema", "Zoom ultra", "Ajustar altura", "Ajustar largura",
++  "Custom Stretch"
+ };
+ 
+ const char *player_aspecto_rotulo(int modo) {
+@@ -1417,6 +1418,15 @@ static float   janT;
+ static Uint32  janEm;
+ static PlrRect janDe, janPara, janAgora;
+ 
++// CUSTOM STRETCH: area da imagem (fracoes do quadro) sem as tarjas pretas que o
++// proprio arquivo traz, medida pelo Kotlin (NvPlayer.stretchCrop). Enquanto nao
++// ha medida confirmada o modo se comporta como Original.
++static int   csTem;
++static float csE, csC, csD, csB;
++#ifdef NV_ANDROID
++static Uint32 csProx;
++#endif
++
+ static PlrRect aspectoRect(int modo) {
+   const float tela = NV_TELA_W / NV_TELA_H;
+   float q = aspectoQuadro();
+@@ -1424,6 +1434,16 @@ static PlrRect aspectoRect(int modo) {
+   PlrRect r;
+   if (q <= 0.0f) q = tela;
+ 
++  // A imagem inteira cai na tela: o quadro e esticado ate a area medida preencher
++  // NV_TELA_W x NV_TELA_H, o que sobra (as tarjas) sai da tela.
++  if (modo == PLR_ASP_CUSTOM_STRETCH && csTem) {
++    r.w = NV_TELA_W / (csD - csE);
++    r.h = NV_TELA_H / (csB - csC);
++    r.x = -csE * r.w;
++    r.y = -csC * r.h;
++    return r;
++  }
++
+   // 1) o object-fit do modo. Os tres casos sao os do ASPECT_MODE_DEFINITIONS.
+   switch (modo) {
+     case PLR_ASP_ESTICAR:                       // fill
+@@ -1603,6 +1623,8 @@ static void aplicarAspecto(void) {
+   if (!video_recorte_fonte() && modoPrecisaRecorte(aspecto))
+     aspecto = PLR_ASP_ORIGINAL;
+ 
++  if (aspecto == PLR_ASP_CUSTOM_STRETCH && !video_stretch_disponivel()) aspecto = PLR_ASP_ORIGINAL;
++
+   r = aspectoRect(aspecto);
+   d = aspectoVisivel(aspecto);
+   if (d.w < 1.0f || d.h < 1.0f || r.w < 1.0f || r.h < 1.0f) return;
+@@ -1690,6 +1712,7 @@ static int modoPrecisaRecorte(int modo) {
+ // esticando". Oferecer dois modos que fazem o que dizem e melhor que oito em
+ // que seis mentem.
+ static int modoDisponivel(int modo) {
++  if (modo == PLR_ASP_CUSTOM_STRETCH) return video_stretch_disponivel();
+   if (video_recorte_fonte()) return 1;
+   return !modoPrecisaRecorte(modo);
+ }
+@@ -4337,6 +4360,27 @@ static void introTmdbTardio(Uint32 agora) {
+   }
+ }
+ 
++#ifdef NV_ANDROID
++// Custom Stretch: pergunta ao Kotlin, a cada meio segundo, a area da imagem
++// medida ate agora; quando muda (ou some, numa fonte nova) o aspecto e refeito.
++static void customStretchTick(Uint32 agora) {
++  float e = 0, c = 0, d = 1, b = 1;
++  int tem;
++  if ((int)(agora - csProx) < 0) return;
++  csProx = agora + 500u;
++  tem = video_stretch_amostra(&e, &c, &d, &b);
++  if (tem && (d - e < 0.2f || b - c < 0.2f)) tem = 0;
++  if (!tem && !csTem) return;
++  if (tem && csTem && fabsf(e - csE) < 0.002f && fabsf(c - csC) < 0.002f &&
++      fabsf(d - csD) < 0.002f && fabsf(b - csB) < 0.002f) return;
++  csTem = tem;
++  if (tem) { csE = e; csC = c; csD = d; csB = b; }
++  printf("[aspecto] custom stretch %s %.3f,%.3f-%.3f,%.3f\n", tem ? "area" : "sem area", e, c, d, b);
++  fflush(stdout);
++  aplicarAspecto();
++}
++#endif
++
+ void player_atualizar(float dt, Uint32 agora) {
+ #ifdef NV_TOUCH_UI
+   playerTelaAtualizar();
+@@ -4441,7 +4485,8 @@ void player_atualizar(float dt, Uint32 agora) {
+   // ficaria calculado com o chute de 16:9 para sempre, e num arquivo 3840x1606
+   // (que e o caso real medido nesta TV) o "Original" cortaria a imagem.
+ #ifdef NV_ANDROID
+-  if (!comVideo) aspPendente = 0;   // fonte fechada: cancela
++  if (!comVideo) { aspPendente = 0; csTem = 0; }   // fonte fechada: cancela
++  else if (!aspPendente && aspecto == PLR_ASP_CUSTOM_STRETCH && video_pronto()) customStretchTick(agora);
+   else if (aspPendente && video_pronto()) {
+     // video_pronto() = primeiro quadro renderizado (EV_PRIMEIRO_QUADRO).
+     // Espera a superficie ESTAVEL (ultima recriacao do HDR/DV, NvPlayer.kt);
+diff --git a/src/player.h b/src/player.h
+index 626f8f25..965f4a01 100644
+--- a/src/player.h
++++ b/src/player.h
+@@ -287,6 +287,7 @@ typedef enum {
+   PLR_ASP_ZOOM_ULTRA,     // "Ultra Zoom"      contain x 1.55
+   PLR_ASP_FIT_ALTURA,     // "Fit Height"      cover
+   PLR_ASP_FIT_LARGURA,    // "Fit Width"       contain
++  PLR_ASP_CUSTOM_STRETCH, // "Custom Stretch"  a imagem sem as tarjas pretas do arquivo, esticada na tela (so Android)
+   PLR_ASP_N
+ } PlrAspecto;
+ 
+diff --git a/src/video.h b/src/video.h
+index cd929147..7a433e64 100644
+--- a/src/video.h
++++ b/src/video.h
+@@ -95,6 +95,15 @@ void video_janela_fonte(int sx, int sy, int sw, int sh,
+ //
+ // Com essas tres, encaixar e esticar saem; recortar e ampliar nao saem.
+ int  video_recorte_fonte(void);
++// Custom Stretch (so Android): area da imagem sem as tarjas pretas do arquivo, em
++// fracoes do quadro. 1 = medida confirmada; 0 = ainda nao se sabe.
++#ifdef NV_ANDROID
++int  video_stretch_disponivel(void);
++int  video_stretch_amostra(float *esq, float *cima, float *dir, float *baixo);
++#else
++static inline int video_stretch_disponivel(void) { return 0; }
++static inline int video_stretch_amostra(float *e, float *c, float *d, float *b) { (void)e; (void)c; (void)d; (void)b; return 0; }
++#endif
+ // Manda de novo ao plano o ultimo par fonte/destino, sem o dedup. Existe para
+ // o trailer (trailer.c): o pipeline prende o plano em mais de um ponto depois
+ // do load e pode engolir um recorte pedido cedo.
+diff --git a/src/video_android.c b/src/video_android.c
+index 742675ec..750dcb37 100644
+--- a/src/video_android.c
++++ b/src/video_android.c
+@@ -73,6 +73,8 @@ static jmethodID mTitulo, mDescartar, mMorno, mQuadro;
+ // #202 (opcional, como os de cima): velocidade(centesimos). Casca sem ele =
+ // sem a linha da velocidade.
+ static jmethodID mVelocidade;
++// Custom Stretch (opcional): stretchCrop() -> long.
++static jmethodID mStretch;
+ 
+ static int resolverMetodos(JNIEnv *env) {
+   mAbrir    = (*env)->GetStaticMethodID(env, gCls, "abrir", "(Ljava/lang/String;Ljava/lang/String;)V");
+@@ -84,6 +86,8 @@ static int resolverMetodos(JNIEnv *env) {
+   mJanelaPronta = (*env)->GetStaticMethodID(env, gCls, "janelaPronta", "()Z");
+   mEscolher = (*env)->GetStaticMethodID(env, gCls, "escolher", "(II)V");
+   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); return 0; }
++  mStretch = (*env)->GetStaticMethodID(env, gCls, "stretchCrop", "()J");
++  if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mStretch = NULL; }
+   mLimitedConnections = (*env)->GetStaticMethodID(env, gCls, "limitedConnections", "(I)V");
+   if ((*env)->ExceptionCheck(env)) { (*env)->ExceptionClear(env); mLimitedConnections = NULL; }
+   // Opcional: uma casca anterior ainda abre normalmente e recebe o seek
+@@ -1159,6 +1163,22 @@ void video_janela_fonte(int sx, int sy, int sw, int sh, int dx, int dy, int dw,
+   janelaSeMudou(X, Y, W, H, 0);
+ }
+ int  video_recorte_fonte(void) { return 1; }
++int  video_stretch_disponivel(void) { return mStretch != NULL; }
++// Area da imagem sem tarjas (NvPlayer.stretchCrop): milesimos empacotados
++// esq | cima << 10 | dir << 20 | baixo << 30, bit 62 = medida confirmada.
++int  video_stretch_amostra(float *esq, float *cima, float *dir, float *baixo) {
++  JNIEnv *env = ambiente();
++  jlong v;
++  if (!env || !mStretch) return 0;
++  v = (*env)->CallStaticLongMethod(env, gCls, mStretch);
++  fimChamada(env);
++  if (!((v >> 62) & 1)) return 0;
++  *esq   = (float)(v & 1023) / 1000.0f;
++  *cima  = (float)((v >> 10) & 1023) / 1000.0f;
++  *dir   = (float)((v >> 20) & 1023) / 1000.0f;
++  *baixo = (float)((v >> 30) & 1023) / 1000.0f;
++  return 1;
++}
+ void video_recorte_reaplicar(void) { if (temUlt) janelaKt(ultX, ultY, ultW, ultH, 0); }
+ // O Kotlin escala 1920x1080 de layout para a camada real; nada a fazer aqui.
+ void video_escala_definir(int sw, int sh) { (void)sw; (void)sh; }

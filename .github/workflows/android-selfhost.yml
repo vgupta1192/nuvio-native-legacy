@@ -1,0 +1,263 @@
+name: Build Nuvio Native Legacy Android (upstream release sync)
+# sync-pulse: init
+
+on:
+  push:
+    branches: [master]
+    paths: ['.github/**']
+  workflow_dispatch:
+    # Same scheme as the NuvioTV fork: builds are triggered by the watcher on vgupta1192's box
+    # (~/bin/nuvio-sync-check.sh legacy), which pushes a sync-pulse commit when upstream has an
+    # unbuilt release. It lands here via the push trigger above.
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-nuvio-native-legacy-android
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: iqui27/nuvio-native-legacy
+  TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+  TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Check upstream release
+        id: ver
+        env:
+          HEAD_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          # Newest non-draft release, prereleases included (same rule as the other forks).
+          REL=$(curl -s -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/$UPSTREAM/releases?per_page=20" \
+            | python3 -c "import json,sys;r=[x for x in json.load(sys.stdin) if not x.get('draft')];r.sort(key=lambda x:x.get('published_at') or '',reverse=True);print(json.dumps(r[0]))")
+          UP=$(printf '%s' "$REL" | python3 -c "import json,sys;print(json.load(sys.stdin)['tag_name'])")
+          {
+            echo 'notes<<GHR_NOTES_EOF_9d41f'
+            printf 'Fork CI build of upstream %s (Android APK, self-hosted backend, Custom Stretch).\n\n' "$UP"
+            printf '%s' "$REL" | python3 -c "import json,sys;print(json.load(sys.stdin).get('body') or '(no upstream release notes)')"
+            echo 'GHR_NOTES_EOF_9d41f'
+          } >> "$GITHUB_OUTPUT"
+          VER="${UP%%-*}"; VER="${VER#v}"
+          echo "upstream tag: $UP (version $VER)"
+          BUILT=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${{ github.token }}" "https://api.github.com/repos/${{ github.repository }}/releases/tags/legacy-android-$UP")
+          # workflow_dispatch or a head commit message containing [force-build] rebuilds
+          # even when the release already exists
+          FORCE=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then FORCE=true; fi
+          if echo "$HEAD_MSG" | grep -qi '\[force-build\]'; then FORCE=true; fi
+          SHOULD=true
+          if [ "$BUILT" = "200" ] && [ "$FORCE" != "true" ]; then
+            echo "already built, skipping"; SHOULD=false
+          fi
+          echo "should_build=$SHOULD" >> "$GITHUB_OUTPUT"
+          echo "tag=$UP" >> "$GITHUB_OUTPUT"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          repository: iqui27/nuvio-native-legacy
+          ref: master
+
+      - uses: actions/checkout@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          path: fork-src
+          sparse-checkout: .github/patches
+
+      # Optional fork patches, one per feature. Warning-only: a patch that no longer applies is
+      # skipped and the build goes on without it.
+      #   custom-stretch: aspect mode "Custom Stretch" (removes the black bars baked into the file)
+      - name: Apply fork patches
+        id: patches
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          APPLIED=""; SKIPPED=""
+          for P in custom-stretch; do
+            if git apply "fork-src/.github/patches/$P.patch"; then
+              echo "applied $P.patch"; APPLIED="$APPLIED $P"
+            else
+              echo "::warning::$P.patch no longer applies to upstream master; building without it"
+              git reset --hard -q; git clean -fdq -e fork-src
+              SKIPPED="$SKIPPED $P"
+            fi
+          done
+          echo "applied=${APPLIED# }" >> "$GITHUB_OUTPUT"
+          echo "skipped=${SKIPPED# }" >> "$GITHUB_OUTPUT"
+          git status --short | grep -v fork-src || true
+
+      # Self-hosted backend: tools/env.sh bakes these values into the native core
+      # (-DNV_SUPABASE_URL ... via local.properties), so the app talks to the self-hosted
+      # Supabase stack instead of api.nuvio.tv. Same values as the NuvioTV fork.
+      - name: Create local.properties (self-hosted backend)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          printf '%s\n' \
+            'NUVIO_SUPABASE_URL=https://nuviobackend.kissmissi.duckdns.org' \
+            'NUVIO_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzg5NzY2MDkyLCJleHAiOjE5NDc0NDYwOTJ9.XB5a12DpW9Uf11QARCv4AAfYHGyk4qRq2Oi_7t8t7X0' \
+            'TV_LOGIN_WEB_BASE_URL=https://nuvioweb.kissmissi.duckdns.org/tv-login' \
+            'SIMKL_CLIENT_ID=cf7f2a335cfcd9759fa01d752d9cf8f42fb4fa1a4e4ff08fe4cafb84ec836621' \
+            'SIMKL_APP_NAME=nuvio-native-legacy' \
+            'TMDB_API_KEY=af624aa414c84ad32d55d5ac45feae76' \
+            > local.properties
+          tools/env.sh --require-core > /dev/null
+
+      - uses: actions/setup-java@v4
+        if: steps.ver.outputs.should_build == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Install Android SDK parts (NDK 27.2, CMake 3.22.1, platform 35)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Install Rust Android targets (mkv core) and ffmpeg (art)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg ninja-build
+          {
+            echo "RUSTUP_HOME=$HOME/.rustup"
+            echo "CARGO_HOME=$HOME/.cargo"
+          } >> "$GITHUB_ENV"
+
+      # libcurl/mbedTLS/libjpeg/libwebp, the SDL sources and the media3 FFmpeg decoder take a
+      # long time to build; reuse them. restore + save are split so the cache is saved even
+      # when a later step fails.
+      - name: Restore native dependency cache
+        id: depcache
+        if: steps.ver.outputs.should_build == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/nuvio-android
+          key: nl-android-deps-${{ hashFiles('tools/android/deps.sh', 'tools/android/ffmpeg-android.sh') }}
+
+      - name: Build native dependencies (curl, jpeg, webp)
+        if: steps.ver.outputs.should_build == 'true'
+        run: bash tools/android/deps.sh
+
+      - name: Fetch CI signing keystore (from the NuvioTV fork)
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/vgupta1192/NuvioTV/master/nuviotv.jks -o "$RUNNER_TEMP/nuviotv.jks"
+          test -s "$RUNNER_TEMP/nuviotv.jks"
+
+      - name: Build release APK
+        if: steps.ver.outputs.should_build == 'true'
+        env:
+          NUVIO_REQUIRE_CORE: '1'
+          NUVIO_P2P_MOTOR: none
+          NUVIO_ANDROID_JOBS: '4'
+          NUVIO_KEYSTORE: ${{ runner.temp }}/nuviotv.jks
+          NUVIO_KEYSTORE_PASS: '815787'
+          NUVIO_KEY_ALIAS: nuviotv
+          NUVIO_KEY_PASS: '815787'
+        run: |
+          set -o pipefail
+          if ! bash tools/android.sh --release-only 2>&1 | tee build-log-release.txt; then
+            grep -E '^e: |error:|ERROR' build-log-release.txt | head -30 | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            grep -E 'What went wrong' -A4 build-log-release.txt | head -12 | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            grep -v '^\s*$' build-log-release.txt | grep -v '^\s*at ' | tail -25 | while IFS= read -r line; do echo "::warning::${line:0:900}"; done
+            exit 1
+          fi
+
+      # Saved once the FFmpeg AAR exists (deps.sh and ffmpeg-android.sh both finished), also when
+      # a later Gradle step failed.
+      - name: Save native dependency cache
+        if: always() && steps.ver.outputs.should_build == 'true' && steps.depcache.outputs.cache-hit != 'true' && hashFiles('build/android/media3-ffmpeg-16kb.aar') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/nuvio-android
+          key: nl-android-deps-${{ hashFiles('tools/android/deps.sh', 'tools/android/ffmpeg-android.sh') }}
+
+      - name: Rename artifacts
+        if: steps.ver.outputs.should_build == 'true'
+        run: |
+          mkdir -p release-files
+          for f in build/android/Nuvio-*-android.apk; do
+            cp "$f" "release-files/NuvioNativeLegacy-${{ steps.ver.outputs.ver }}-b${{ github.run_number }}-android.apk"
+          done
+          ls -l release-files
+
+      - name: Upload artifacts
+        if: steps.ver.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioNativeLegacy-apk
+          path: release-files/*.apk
+          if-no-files-found: error
+
+      - name: Publish to release
+        if: steps.ver.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: legacy-android-${{ steps.ver.outputs.tag }}
+          name: Nuvio Native Legacy Android ${{ steps.ver.outputs.tag }}
+          prerelease: true
+          body: ${{ steps.ver.outputs.notes }}
+          files: release-files/*.apk
+
+      - name: Remove older assets of this release
+        if: steps.ver.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: legacy-android-${{ steps.ver.outputs.tag }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+            | jq -r --argjson run "${{ github.run_number }}" '.assets[]
+                | select((((.name | capture("-b(?<n>[0-9]+)-") | .n) // "0") | tonumber) < $run)
+                | .id' \
+            | while read -r id; do
+                echo "deleting older asset $id"
+                gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id"
+              done
+
+      - name: Notify Telegram
+        if: steps.ver.outputs.should_build == 'true' && env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
+        env:
+          REL_TAG: legacy-android-${{ steps.ver.outputs.tag }}
+          VER: ${{ steps.ver.outputs.tag }}
+          APPLIED: ${{ steps.patches.outputs.applied }}
+          SKIPPED: ${{ steps.patches.outputs.skipped }}
+          BUILD_NO: ${{ github.run_number }}
+        run: |
+          NOTE="Self-hosted backend baked in"
+          if [ -n "$APPLIED" ]; then NOTE="${NOTE}
+          Patches: ${APPLIED}"; fi
+          if [ -n "$SKIPPED" ]; then NOTE="${NOTE}
+          ⚠️ did NOT apply (built without): ${SKIPPED}"; fi
+          HASH=""
+          for f in release-files/*.apk; do
+            [ -e "$f" ] || continue
+            HASH="${HASH}$(basename "$f"): $(stat -c%s "$f") bytes, sha256 $(sha256sum "$f" | cut -c1-16)..."
+          done
+          MSG="📺 Nuvio Native Legacy Android ${VER} is ready (build ${BUILD_NO})
+          ${NOTE}
+          ${HASH}
+          Download: https://github.com/${{ github.repository }}/releases/tag/${REL_TAG}"
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            --data-urlencode "text=${MSG}" > /dev/null
+
+      - name: Attach build log on failure
+        if: failure() && hashFiles('build-log-release.txt') != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: legacy-android-debug-logs
+          name: Nuvio Native Legacy CI debug logs
+          prerelease: true
+          files: build-log-release.txt
